@@ -8,7 +8,6 @@ import torch.backends.cudnn as cudnn
 from  torchvision import datasets, transforms
 
 import nets.bagnet
-import nets.resnet
 
 import os 
 import joblib
@@ -188,9 +187,27 @@ def masking_defense(local_feature, clipping=-1, window_shape=[6,6]):
 
 
 
+import numpy as np
+
+def get_boundary_mask(mask):
+    """
+    計算二值化 Mask 的 4-connected 邊界 (Partial Boundary)
+    回傳與原圖相同大小的 boolean array，邊界為 True
+    """
+    tmp_mask = mask.copy()
+    # 往四個方向平移一格 (上下左右)
+    tmp_mask[1:, :] |= mask[:-1, :]
+    tmp_mask[:-1, :] |= mask[1:, :]
+    tmp_mask[:, 1:] |= mask[:, :-1]
+    tmp_mask[:, :-1] |= mask[:, 1:]
+    
+    # 邊界 = (擴張後的區域) 交集 (非原本的區域)
+    partial_boundary = tmp_mask & ~mask
+    return partial_boundary
+
 def provable_masking(local_feature, label, clipping=-1, window_shape=[6, 6]):
     """
-    Provable Analysis of Robust Inpainting (Algorithm 2)
+    Provable Analysis of Robust Inpainting (Algorithm 2 with Dual-Guarantee)
     Returns:
       0 : Incorrect without attack (Clean accuracy failed)
       1 : Vulnerable to attack (Provable robustness failed)
@@ -209,52 +226,77 @@ def provable_masking(local_feature, label, clipping=-1, window_shape=[6, 6]):
     if y1 != label:
         return 0  # Incorrect without attack
 
-    # 2. 窮舉所有可能的貼片視窗位置 w \in W
+    # 準備全域聯集 Mask (Phase 2 使用)
+    global_rm_mask = np.zeros((H, W), dtype=bool)
+
+    # -------------------------------------------------------------
+    # Phase 1: Single-Window Verification & Aggregation
+    # -------------------------------------------------------------
     num_win_x, num_win_y = H - win_h + 1, W - win_w + 1 
     
     for r in range(num_win_x):
         for c in range(num_win_y):
-            # 定義當前視窗 w (即潛在的 R_M)
+            # 定義當前視窗 w 
             rm_mask = np.zeros((H, W), dtype=bool)
             rm_mask[r:r+win_h, c:c+win_w] = True
             
+            # 計算 Masked prediction (y4)
             masked_feature = processed_feature.copy()
             masked_feature[rm_mask, :] = 0  # 模擬 (1 - w) \odot U
             
-            y4_logits = softmax(np.sum(masked_feature, axis=(0, 1)))
-            y4 = np.argmax(y4_logits)
+            y4 = np.argmax(softmax(np.sum(masked_feature, axis=(0, 1))))
             
-            # --- 步驟 B: 計算 Worst-Case Inpainting 預測結果 (y5) ---
-            # 計算 \partial R_M (4-connected boundary)
-            tmp_mask = rm_mask.copy()
-            tmp_mask[1:, :] |= rm_mask[:-1, :]
-            tmp_mask[:-1, :] |= rm_mask[1:, :]
-            tmp_mask[:, 1:] |= rm_mask[:, :-1]
-            tmp_mask[:, :-1] |= rm_mask[:, 1:]
-            partial_rm_mask = tmp_mask & ~rm_mask
+            # 取得單一窗口邊界
+            partial_rm_mask = get_boundary_mask(rm_mask)
             
             if not np.any(partial_rm_mask):
-                return 1
+                return 1 # 邊緣情況：若貼片大到覆蓋整張圖，視為脆弱
 
+            # 計算 Worst-Case Inpainting 預測結果 (y5)
             worst_case_feature = processed_feature.copy()
             for ch in range(num_cls):
                 valid_vals = processed_feature[partial_rm_mask, ch]
-                
-                if ch == label:
-                    fill_val = np.min(valid_vals)
-                else:
-                    fill_val = np.max(valid_vals)
-                    
+                fill_val = np.min(valid_vals) if ch == label else np.max(valid_vals)
                 worst_case_feature[rm_mask, ch] = fill_val
 
-            y5_logits = softmax(np.sum(worst_case_feature, axis=(0, 1)))
-            y5 = np.argmax(y5_logits)
+            y5 = np.argmax(softmax(np.sum(worst_case_feature, axis=(0, 1))))
             
-            if y4 != label and y5 != label:
-                return 1  # Vulnerable to an attack at w
+            # 若偵測機制被觸發 (y4 != y)，則收集此窗口，並檢查單一窗口脆弱性
+            if y4 != label:
+                global_rm_mask |= rm_mask  # 聯集操作 (Phase 2 使用)
                 
-    # 遍歷所有位置，均沒有發現真實的漏洞，證明成功
+                if y5 != label:
+                    return 1  # Vulnerable to a single-window attack at w
+
+    # -------------------------------------------------------------
+    # Phase 2: Global Union-Window Verification
+    # -------------------------------------------------------------
+    # 只有在 Phase 1 中有任何窗口被觸發時，才需要做全域聯集驗證
+    if np.any(global_rm_mask):
+        global_partial_rm_mask = get_boundary_mask(global_rm_mask)
+        
+        # 如果聯集起來的大窗口大到吃掉所有良性特徵，則視為脆弱
+        if not np.any(global_partial_rm_mask):
+            return 1
+            
+        global_worst_case_feature = processed_feature.copy()
+        
+        for ch in range(num_cls):
+            valid_vals = processed_feature[global_partial_rm_mask, ch]
+            # 根據極值填補全域聯集大窗口
+            fill_val = np.min(valid_vals) if ch == label else np.max(valid_vals)
+            global_worst_case_feature[global_rm_mask, ch] = fill_val
+        
+        y6 = np.argmax(softmax(np.sum(global_worst_case_feature, axis=(0, 1))))
+        
+        if y6 != label:
+            return 1  # Vulnerable to multi-window attack payload (Phase 2 fail)
+
+    # 所有位置的單一窗口與聯集大窗口均通過極值驗證，證明成功！
     return 2  # Provably robust
+    
+    
+    
 
 
 rf_stride=8
@@ -289,4 +331,3 @@ for data,labels in tqdm(val_loader):
 cases,cnt=np.unique(result_list,return_counts=True)
 print(cnt[-1]/len(result_list) if len(cnt)==3 else 0)
 print(clean_corr/len(result_list))
-
